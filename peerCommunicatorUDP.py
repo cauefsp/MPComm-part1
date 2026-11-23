@@ -14,12 +14,9 @@ import MPComm_pb2
 import MPComm_pb2_grpc
 from constMP import *
 
-handshake_count = 0
-
-send_socket = socket(AF_INET, SOCK_DGRAM)
-recv_socket = socket(AF_INET, SOCK_DGRAM)
-recv_socket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-recv_socket.bind(('0.0.0.0', PEER_UDP_PORT))
+udp_socket = socket(AF_INET, SOCK_DGRAM)
+udp_socket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+udp_socket.bind(('0.0.0.0', PEER_UDP_PORT))
 
 group_manager = MPComm_pb2_grpc.GroupManagerStub(
     grpc.insecure_channel(GROUPMNGR_ADDR + ':' + str(GROUPMNGR_PORT)))
@@ -27,6 +24,13 @@ comparison_server = MPComm_pb2_grpc.ComparisonServerStub(
     grpc.insecure_channel(SERVER_ADDR + ':' + str(SERVER_PORT)))
 
 start_requests = queue.Queue()
+delivered_messages = queue.Queue()
+
+next_seq_number = 0
+unacked_packets = {}
+unacked_lock = threading.Lock()
+expected_seq_numbers = {}
+held_back_messages = {}
 
 
 def get_public_ip():
@@ -52,42 +56,81 @@ class PeerService(MPComm_pb2_grpc.PeerServicer):
         return MPComm_pb2.StartReply(status='Peer process ' + str(request.peer_id) + ' started.')
 
 
-class MsgHandler(threading.Thread):
-    def __init__(self, sock, my_id):
-        threading.Thread.__init__(self)
-        self.sock = sock
-        self.my_id = my_id
+def multicast(sender, peers, content):
+    global next_seq_number
+    seq = next_seq_number
+    next_seq_number += 1
+    packet = pickle.dumps(('MSG', sender, seq, content))
+    for peer_ip in peers:
+        with unacked_lock:
+            unacked_packets[(peer_ip, seq)] = (packet, time.time())
+            udp_socket.sendto(packet, (peer_ip, PEER_UDP_PORT))
 
-    def run(self):
-        global handshake_count
-        print('Handler is ready. Waiting for the handshakes...')
 
-        while handshake_count < N_PEERS:
-            msg = pickle.loads(self.sock.recv(1024))
-            if msg[0] == 'READY':
-                handshake_count += 1
-                print('--- Handshake received:', msg[1])
-        print('Secondary Thread: Received all handshakes. Entering the loop to receive messages.')
+def retransmit_loop():
+    while True:
+        time.sleep(RETRANSMIT_TIMEOUT / 2)
+        now = time.time()
+        with unacked_lock:
+            for (peer_ip, seq), (packet, sent_time) in unacked_packets.items():
+                if now - sent_time > RETRANSMIT_TIMEOUT:
+                    print('Retransmitting message', seq, 'to', peer_ip)
+                    udp_socket.sendto(packet, (peer_ip, PEER_UDP_PORT))
+                    unacked_packets[(peer_ip, seq)] = (packet, now)
 
-        log_list = []
-        stop_count = 0
-        while True:
-            msg = pickle.loads(self.sock.recv(1024))
-            if msg[0] == -1:
-                stop_count += 1
-                if stop_count == N_PEERS:
-                    break
-            else:
-                print('Message ' + str(msg[1]) + ' from process ' + str(msg[0]))
-                log_list.append(msg)
 
-        with open('logfile' + str(self.my_id) + '.log', 'w') as log_file:
-            log_file.write(str(log_list))
+def receive_loop():
+    while True:
+        packet, address = udp_socket.recvfrom(1024)
+        msg = pickle.loads(packet)
+        if msg[0] == 'ACK':
+            with unacked_lock:
+                unacked_packets.pop((address[0], msg[1]), None)
+            continue
 
-        print('Sending the list of messages to the server for comparison...')
-        messages = [MPComm_pb2.LoggedMessage(sender=sender, number=number) for sender, number in log_list]
-        comparison_server.SendLog(MPComm_pb2.MessageLog(peer_id=self.my_id, messages=messages))
-        handshake_count = 0
+        _, sender, seq, content = msg
+        udp_socket.sendto(pickle.dumps(('ACK', seq)), address)
+        expected_seq = expected_seq_numbers.get(sender, 0)
+        held_back = held_back_messages.setdefault(sender, {})
+        if seq < expected_seq or seq in held_back:
+            continue
+
+        held_back[seq] = content
+        if seq > expected_seq:
+            print('Holding back message', seq, 'from process', sender, 'while waiting for', expected_seq)
+            continue
+
+        while expected_seq in held_back:
+            delivered_messages.put((sender, held_back.pop(expected_seq)))
+            expected_seq += 1
+        expected_seq_numbers[sender] = expected_seq
+
+
+def handle_messages(my_id, all_ready):
+    print('Handler is ready. Waiting for the handshakes...')
+    ready_count = 0
+    stop_count = 0
+    log_list = []
+    while stop_count < N_PEERS:
+        sender, content = delivered_messages.get()
+        if content == 'READY':
+            ready_count += 1
+            print('--- Handshake received:', sender)
+            if ready_count == N_PEERS:
+                print('Secondary Thread: Received all handshakes. Entering the loop to receive messages.')
+                all_ready.set()
+        elif content == 'STOP':
+            stop_count += 1
+        else:
+            print('Message ' + str(content) + ' from process ' + str(sender))
+            log_list.append((sender, content))
+
+    with open('logfile' + str(my_id) + '.log', 'w') as log_file:
+        log_file.write(str(log_list))
+
+    print('Sending the list of messages to the server for comparison...')
+    messages = [MPComm_pb2.LoggedMessage(sender=sender, number=number) for sender, number in log_list]
+    comparison_server.SendLog(MPComm_pb2.MessageLog(peer_id=my_id, messages=messages))
 
 
 def main():
@@ -95,6 +138,8 @@ def main():
     MPComm_pb2_grpc.add_PeerServicer_to_server(PeerService(), rpc_server)
     rpc_server.add_insecure_port('0.0.0.0:' + str(PEER_RPC_PORT))
     rpc_server.start()
+    threading.Thread(target=receive_loop, daemon=True).start()
+    threading.Thread(target=retransmit_loop, daemon=True).start()
 
     ip_address = sys.argv[1] if len(sys.argv) > 1 else get_public_ip()
     register_with_group_manager(ip_address)
@@ -105,25 +150,21 @@ def main():
         if n_msgs == 0:
             break
 
-        MsgHandler(recv_socket, my_id).start()
+        all_ready = threading.Event()
+        threading.Thread(target=handle_messages, args=(my_id, all_ready)).start()
         peers = get_list_of_peers()
-        for peer_ip in peers:
-            print('Sending handshake to', peer_ip)
-            send_socket.sendto(pickle.dumps(('READY', my_id)), (peer_ip, PEER_UDP_PORT))
-        print('Main Thread: Sent all handshakes. handshake_count =', handshake_count)
+        print('Sending handshake to', peers)
+        multicast(my_id, peers, 'READY')
+        print('Main Thread: Sent all handshakes.')
 
-        while handshake_count < N_PEERS:
-            pass
+        all_ready.wait()
 
         for msg_number in range(n_msgs):
             time.sleep(random.randrange(10, 100) / 1000)
-            msg_pack = pickle.dumps((my_id, msg_number))
-            for peer_ip in peers:
-                send_socket.sendto(msg_pack, (peer_ip, PEER_UDP_PORT))
+            multicast(my_id, peers, msg_number)
             print('Sent message', msg_number)
 
-        for peer_ip in peers:
-            send_socket.sendto(pickle.dumps((-1, -1)), (peer_ip, PEER_UDP_PORT))
+        multicast(my_id, peers, 'STOP')
 
     print('Terminating.')
     rpc_server.stop(1).wait()

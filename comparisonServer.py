@@ -36,6 +36,17 @@ def wait_for_logs_and_compare(received_logs, n_msgs):
         message_log = received_logs.get()
         logs[message_log.peer_id] = [(m.sender, m.number) for m in message_log.messages]
 
+    for peer_id, log in enumerate(logs):
+        lost = N_PEERS * n_msgs - len(set(log))
+        fifo_violations = 0
+        highest_numbers = {}
+        for sender, number in log:
+            if number < highest_numbers.get(sender, -1):
+                fifo_violations += 1
+            else:
+                highest_numbers[sender] = number
+        print('Peer ' + str(peer_id) + ': ' + str(lost) + ' lost messages, ' + str(fifo_violations) + ' FIFO violations')
+
     unordered = 0
     for j in range(0, n_msgs - 1):
         first_msg = logs[0][j]

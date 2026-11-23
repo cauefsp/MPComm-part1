@@ -7,7 +7,7 @@ fi
 
 DELAY=${DELAY:-50ms}
 JITTER=${JITTER:-40ms}
-LOSS=${LOSS:-0%}
+LOSS=${LOSS:-10%}
 
 cd "$(dirname "$0")"
 N_PEERS=$(python3 -c 'from constMP import N_PEERS; print(N_PEERS)')
