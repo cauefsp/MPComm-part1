@@ -1,39 +1,46 @@
-from socket import *
-import pickle
+import threading
+from concurrent import futures
+
+import grpc
+
+import MPComm_pb2
+import MPComm_pb2_grpc
 from constMP import *
 
-port = GROUPMNGR_TCP_PORT
-membership = []
 
-def serverLoop():
-  serverSock = socket(AF_INET, SOCK_STREAM)
-  # Allow immediate reuse of the port after closing
-  serverSock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-  serverSock.bind(('0.0.0.0', port))
-  serverSock.listen(6)
-  while(1):
-    (conn, addr) = serverSock.accept()
-    msgPack = conn.recv(2048)
-    req = pickle.loads(msgPack)
-    if req["op"] == "register":
-      membership.append((req["ipaddr"],req["port"]))
-      print ('Registered peer: ', req)
-    elif req["op"] == "list":
-      list = []
-      for m in membership:
-        list.append(m[0])
-      print ('List of peers sent to server: ', list)
-      conn.send(pickle.dumps(list))
-    elif req["op"] == "unregister":
-      # to do
-      pass
-    elif req["op"] == "stop":
-      print("Stopping.")
-      serverSock.close()
-      break
-    else:
-      pass # fix (send back an answer in case of unknown op
+class GroupManager(MPComm_pb2_grpc.GroupManagerServicer):
+    def __init__(self, stop_requested):
+        self.membership = []
+        self.lock = threading.Lock()
+        self.stop_requested = stop_requested
 
-  conn.close()
+    def Register(self, request, context):
+        with self.lock:
+            self.membership.append((request.ip_address, request.port))
+        print('Registered peer:', request.ip_address, request.port)
+        return MPComm_pb2.Empty()
 
-serverLoop()
+    def ListPeers(self, request, context):
+        with self.lock:
+            peers = [ip_address for (ip_address, port) in self.membership]
+        print('List of peers sent:', peers)
+        return MPComm_pb2.PeerList(ip_addresses=peers)
+
+    def Stop(self, request, context):
+        print('Stopping.')
+        self.stop_requested.set()
+        return MPComm_pb2.Empty()
+
+
+def main():
+    stop_requested = threading.Event()
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    MPComm_pb2_grpc.add_GroupManagerServicer_to_server(GroupManager(stop_requested), server)
+    server.add_insecure_port('0.0.0.0:' + str(GROUPMNGR_PORT))
+    server.start()
+    print('Group manager listening on port', GROUPMNGR_PORT)
+    stop_requested.wait()
+    server.stop(1).wait()
+
+
+main()

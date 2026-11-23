@@ -1,20 +1,149 @@
-# MPComm - Multiparty Communication
-Very simple demo of multicast communication without coordination. The intent is to demonstrate how things can go wrong as we scale a distributed system (in this case, scaling in the geographical dimension) without taking appropriate measures to coordinate the behavior of its components. Later, this example will serve as the basis to implement coordination protocols, notably for message ordering, as part of course assignments.
+# MPComm - Parte 1
 
-## Overall structure
-A set of **peer processes** is established and each process multicasts a sequence of messages to all the others at random intervals. Messages are stamped with the ID of the sending process and a local sequence number defined by the sending process. This is a simple attempt to demonstrate the problem of message ordering (or, indeed, the lack of message ordering).
+Trabalho de Sistemas Distribuídos, Parte 1: melhorias nos protocolos de comunicação do
+[MPComm](https://github.com/professorfabio/MPComm) do professor. Este repositório é uma cópia
+integral do original, com o histórico dele preservado, e as mudanças da Parte 1 estão nos commits
+seguintes.
 
-The peer processes run the *peerCommunicatorUDP.py* program, which has two separate threads, one for sending and the other for receiving messages. After starting, a peer processes waits for a signal (from a process that coordinates the experiment) in order to actually start multicasting the sequence of messages. Each peer collects all the received messages (in the order that they were received) and sends the list of messages to the coordinator process, which will compare the order of messages as received by all the peers (as described next).
+Integrantes: Cauê Filipe de Siqueira Pereira e Caio Souza Coelho Gonzaga.
 
-A separate process runs *comparisonServer.py*, which, besides coordinating the start of the peer processes (by sending the start signal mentioned above), waits for the list of received messages from each peer and compares their order. It reports a metric that indicates the occurrence of out-of-order messages (actually, the number of message exchange rounds in which at least one process received a different message form the others). Importantly, we assume that no messages are lost, and, in an ideal scenario, all processes should receive all the same messages in the same order. Note, however, that the current version does not use a reliable message communication protocol to ensure that messages are not lost (this can be an improvement to be implemented as an assignment).
+O MPComm é uma demonstração de comunicação multicast sem coordenação. Um conjunto de peers envia
+mensagens numeradas a todos os outros, em intervalos aleatórios, e um servidor de comparação recolhe a
+ordem em que cada peer recebeu as mensagens e compara essas ordens. Nesta parte, todas as interações
+cliente-servidor, que usavam sockets TCP com pickle, passaram a usar RPC (gRPC). O multicast entre os
+peers continua em sockets UDP.
 
-A second server process, running *GroupMngr.py*, is used for peers to register themselves (notably their IP addresses) as well as to discover the other peers.
+## Arquitetura
 
-In order to actually see the problem of message ordering, it is necessary to introduce variability on message communication latency, such as by running the peer processes on different networks, e.g., running some of the peers in one region of the cloud, whereas the others are run on another region. This illustrates the issue of geographic scalability, when the system works fine when all its components are in the same network, but starts to behave erroneously when its components are spread across the Internet.
+O sistema continua com os mesmos três programas do original:
 
-## Setup
-- Create one instance (virtual machine in the cloud) to run the two servers, and a number of instances (e.g., 6 in one cloud region, 2 on another) to run the peers.
-- Edit *constMP.py* with the correct IP address of the instance where the two servers will run. Tip: allocate a fixed IP address (elastic IP in AWS jargon) to the server instance. Also edit the file to configure the number of peers processes in the experiment.
-- On the server instance, run *GroupMngr.py*
-- On some of the peer instances: run *peerCommunicator.py*
-- Back on the server instance: run *comparisonServer.py*
+- `GroupMngr.py`: gerenciador de grupo. Guarda os endereços dos peers que se registraram e devolve a
+  lista quando pedida.
+- `comparisonServer.py`: coordena o experimento. Pergunta quantas mensagens cada peer deve enviar,
+  dá a largada a cada peer, recebe os logs de mensagens recebidas e compara.
+- `peerCommunicatorUDP.py`: peer. Espera a largada, troca handshakes com os outros peers, envia as
+  mensagens por multicast, registra as que recebe e manda o log para o servidor de comparação.
+
+A tabela mostra cada interação antes e depois desta parte:
+
+| Interação | Original | Parte 1 |
+|---|---|---|
+| Peer se registra no gerenciador de grupo | TCP, pedido `{"op": "register"}` | `GroupManager.Register` |
+| Peer e servidor de comparação pedem a lista de peers | TCP, pedido `{"op": "list"}` | `GroupManager.ListPeers` |
+| Servidor de comparação encerra o gerenciador | TCP, pedido `{"op": "stop"}` | `GroupManager.Stop` |
+| Servidor de comparação dá a largada a cada peer | TCP, o peer escutava na `PEER_TCP_PORT` | `Peer.Start` |
+| Peer envia o log ao servidor de comparação | TCP, lista em pickle | `ComparisonServer.SendLog` |
+| Peers trocam handshakes, mensagens e aviso de fim | UDP | UDP |
+
+Um experimento funciona assim: o servidor de comparação lê o número de mensagens, pede a lista ao
+gerenciador de grupo e chama `Start` em cada peer, passando o ID do peer (a posição dele na lista) e o
+número de mensagens. Cada peer envia um `READY` a todos, espera o `READY` de todos os peers (incluindo
+o próprio), envia suas mensagens numeradas de 0 a n-1 com intervalos aleatórios de 10 a 100 ms e por
+fim um aviso de fim. Quando recebe o aviso de fim de todos, grava `logfile<ID>.log` e chama `SendLog`.
+Depois de receber os logs de todos os peers, o servidor de comparação mostra o resultado e pergunta de
+novo. Com 0, ele chama `Start` com 0 mensagens, o que encerra os peers, e depois `Stop` no gerenciador
+de grupo.
+
+## Parte 1a: RPC no lugar de sockets
+
+As interfaces estão em `MPComm.proto`, com três serviços: `GroupManager` (`Register`, `ListPeers` e
+`Stop`), `ComparisonServer` (`SendLog`) e `Peer` (`Start`). Cada processo é servidor do seu serviço e
+cliente dos serviços dos outros.
+
+No `GroupMngr.py`, o laço de `accept` com a escolha da operação pelo campo `op` virou uma classe com um
+método por RPC. Como o gRPC atende as chamadas em várias threads, a lista de membros é protegida por um
+lock. O `Stop` sinaliza um `threading.Event` e a thread principal desliga o servidor.
+
+No `comparisonServer.py`, o `SendLog` só coloca o log recebido em uma fila, e a thread principal tira
+da fila um log por peer antes de comparar. Os logs chegam com o ID do peer, então ficam indexados por
+ele.
+
+No peer, a espera pela largada era um `accept` na `PEER_TCP_PORT`. Agora o peer sobe um servidor gRPC
+com o serviço `Peer`, e o `Start` coloca o ID e o número de mensagens em uma fila que a thread principal
+lê. Ao terminar, o peer chama `rpc_server.stop(1).wait()`, para que a resposta do último `Start`
+chegue ao servidor de comparação antes de o processo sair.
+
+Em `constMP.py`, `PEER_TCP_PORT` e `GROUPMNGR_TCP_PORT` viraram `PEER_RPC_PORT` e `GROUPMNGR_PORT`, e `N`
+virou `N_PEERS`. O peer também aceita, como argumento opcional, o IP com que deve se registrar. Sem o
+argumento, ele continua usando o IP público obtido no ipify, como no original.
+
+### Comparação entre sockets e RPC
+
+Vantagens do RPC, a partir do que mudou no código:
+
+- A interface entre os processos fica explícita em um arquivo só, o `MPComm.proto`, e os stubs são
+  gerados a partir dele. No original o protocolo era implícito: um dicionário em pickle com um campo
+  `op`, que cliente e servidor tinham que interpretar igual. O `register` não tinha resposta e uma
+  operação desconhecida caía em um `pass`, sem resposta para o cliente. Com gRPC toda chamada tem
+  resposta ou um erro com código de status (`UNAVAILABLE`, por exemplo, quando o servidor não está no
+  ar).
+- O gRPC cuida do enquadramento das mensagens. O original lia cada mensagem com um único `recv` de
+  tamanho fixo (`recv(2048)`, `recv(32768)`), supondo que a mensagem inteira chega em uma leitura e cabe
+  no buffer. Com 6 peers e 1000 mensagens por peer, o log em pickle tem 40.490 bytes e não cabe no
+  `recv(32768)` do servidor de comparação, então o `pickle.loads` receberia a mensagem cortada. Com gRPC
+  o mesmo log (39.220 bytes em protobuf) chegou inteiro no teste com 1000 mensagens, e o limite padrão
+  é de 4 MB por mensagem.
+- Cada interação ficou menor e parece uma chamada local, como
+  `group_manager.ListPeers(MPComm_pb2.Empty())`, sem `connect`, `send`, `recv`, `close` e pickle em
+  cada ponto do código.
+- O servidor gRPC atende várias chamadas ao mesmo tempo com um pool de threads, enquanto o gerenciador
+  de grupo original atendia uma conexão por vez no laço de `accept`.
+- Protobuf só carrega dados e não depende da linguagem. O pickle só funciona entre programas em Python
+  e, ao decodificar bytes vindos da rede, pode executar código escolhido por quem os enviou. Isso deixou
+  de acontecer nas interações que passaram para gRPC; o multicast em UDP manteve o pickle do original.
+
+Desvantagens:
+
+- O sistema passou a depender de bibliotecas externas (`grpcio` e `grpcio-tools`) e de um passo de
+  geração de código. Qualquer mudança em uma mensagem exige gerar os stubs de novo em todas as máquinas.
+- Há mais camadas entre o programa e a rede (protobuf, HTTP/2, conexões mantidas pelo canal e threads
+  do servidor). Para mensagens pequenas como o sinal de largada, isso é mais custo do que um `send` em
+  um socket TCP.
+- O controle do fluxo fica com o framework. O peer, que antes chamava `accept` no momento em que queria
+  esperar a largada, agora mantém um servidor gRPC em outras threads e precisa de uma fila para passar a
+  largada à thread principal. O encerramento também ficou mais delicado, porque o processo não pode sair
+  antes de o gRPC enviar a resposta do último `Start`.
+- O tráfego é binário sobre HTTP/2, o que dificulta inspecionar as mensagens na rede. O modelo de RPC
+  também é ponto a ponto e de pedido e resposta, então não serve para o multicast entre os peers, que
+  continua em UDP.
+
+## Como executar
+
+Requer Python 3. Na raiz do repositório:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install grpcio grpcio-tools requests
+python3 -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. MPComm.proto
+```
+
+### Em uma máquina, com rede emulada (Linux ou WSL)
+
+Com o `.venv` ativado:
+
+```bash
+./run_local.sh
+```
+
+O script cria, sem precisar de root, uma rede isolada com namespaces de rede do Linux: o gerenciador de
+grupo e o servidor de comparação ficam em 10.0.0.1 (o endereço que está no `constMP.py`) e cada um dos
+`N_PEERS` peers fica em um endereço próprio a partir de 10.0.0.11. Nos pacotes que saem de cada peer, o
+`netem` acrescenta atraso de 50 ms com variação de 40 ms, o que faz pacotes chegarem fora de ordem. O
+atraso, a variação e a perda de pacotes (`LOSS`, 0% por padrão) podem ser trocados por variáveis de
+ambiente:
+
+```bash
+DELAY=80ms JITTER=60ms ./run_local.sh
+```
+
+O servidor de comparação roda no terminal e pede o número de mensagens. A saída de cada peer fica em
+`logs/peer-<IP>.out`.
+
+### Em máquinas separadas
+
+Como no original: em `constMP.py`, coloque em `SERVER_ADDR` e `GROUPMNGR_ADDR` o IP da máquina dos
+servidores e ajuste `N_PEERS`. Libere as portas TCP 5678, 5679 e 5680 e a porta UDP 6789. Na máquina dos
+servidores, rode `python3 GroupMngr.py`. Em cada máquina de peer, rode `python3 peerCommunicatorUDP.py`
+(o peer se registra com o IP público; para usar outro, passe o IP como argumento). Por último, rode
+`python3 comparisonServer.py` na máquina dos servidores.
